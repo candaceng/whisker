@@ -1,8 +1,16 @@
 using UnityEngine;
 using System.Collections.Generic;
+using System;
 
 public class Whisker : MonoBehaviour {
-    private LineRenderer lineRenderer;
+    [Header("References")]
+    [SerializeField] private Transform headOrigin;         
+    [SerializeField] private LineRenderer lineRenderer;
+
+    private Vector3[] currentShapeHead;
+    private Vector3[] currentShapeWorld;
+    private int currentFrameIndex;
+
     private MeshCollider meshCollider;
     private List<Vector3[]> framePoints = new List<Vector3[]>();
     private int currentFrame;
@@ -12,21 +20,15 @@ public class Whisker : MonoBehaviour {
     private Vector3 lastContactPoint = Vector3.zero;
     private Vector3 lastContactNormal = Vector3.zero;
     private string lastContactObjectName = "";
-    private int currentFrameIndex;
-    private Vector3[] currentShape;
     private Mesh bakedMesh;
 
     [Header("Collision segments along whisker")]
-    [Tooltip("How many capsule segments approximate this whisker for collisions")]
     public int collisionSegments = 5;  
+    public float colliderRadius = 0.5f;  
+    private WhiskerCollisionSegment[] collisionSegs;
       
     public float thetaWDeg { get; private set; } = 0f;
     public float SContact { get; private set; }  
-
-    [Tooltip("Radius of each collision capsule in world units (meters)")]
-    public float colliderRadius = 1.0f;    // ~1.5 mm, tune to scale
-
-    private WhiskerCollisionSegment[] collisionSegs;
 
     [Tooltip("Eye camera that renders this whisker (assign right/left eye)")]
     public Camera eyeCamera;
@@ -35,9 +37,7 @@ public class Whisker : MonoBehaviour {
     [Range(0.5f, 4f)] public float minPixelsTip = 4.0f;
     [Range(0.1f, 2f)] public float pixelThicknessGain = 2.0f;
     public float maxWorldWidth = 0.1f;
-
-    public int targetPixelHeight = 64;  // height of the final saved PNG (outH)
-    public bool useMeshCollider = true;
+    public int targetPixelHeight = 64; 
 
     float PixelsToWorldWidth(float pixels, float distance) {
         float vfovRad = (eyeCamera ? eyeCamera.fieldOfView : 140f) * Mathf.Deg2Rad;
@@ -46,6 +46,9 @@ public class Whisker : MonoBehaviour {
     }
 
     public void Initialize(List<Vector3[]> allFrames, Material material) {
+        if (headOrigin == null)
+            headOrigin = GameObject.Find("HeadOrigin")?.transform;
+
         framePoints = allFrames;
         
         lineRenderer = gameObject.AddComponent<LineRenderer>();
@@ -71,83 +74,90 @@ public class Whisker : MonoBehaviour {
         blend = Mathf.Clamp01(blend);
         UpdateVisuals(frameIndex, blend, whiskerIndex);
 
-        Debug.Log($"frameIndex: {frameIndex}, theta: {frameIndex - 10f}");
         thetaWDeg = frameIndex - 10f;
     }
 
-    void UpdateVisuals(int frameIndex, float blend, int whiskerIndex) {
+    void UpdateVisuals(int frameIndex, float blend, int whiskerIndex)
+    {
         frameIndex = Mathf.Clamp(frameIndex, 0, framePoints.Count - 2);
         int nextIndex = Mathf.Min(frameIndex + 1, framePoints.Count - 1);
 
         Vector3[] currentFramePositions = framePoints[frameIndex];
-        Vector3[] nextFramePositions = framePoints[nextIndex];
+        Vector3[] nextFramePositions    = framePoints[nextIndex];
 
-        Vector3[] interpolatedPositions = new Vector3[100];
-        for (int i = 0; i < 100; i++) {
-            interpolatedPositions[i] = Vector3.Lerp(currentFramePositions[i], nextFramePositions[i], blend);
-        }
+        // 1) Interpolate in HEAD frame (CSV frame)
+        int N = 100;
+        Vector3[] headPositions = new Vector3[N];
+        for (int i = 0; i < N; i++)
+            headPositions[i] = Vector3.Lerp(currentFramePositions[i], nextFramePositions[i], blend);
 
-        lineRenderer.positionCount = interpolatedPositions.Length;
-        lineRenderer.SetPositions(interpolatedPositions);
-
-        // pick two representative points: near base & tip (local space)
-        Vector3 p0Local = interpolatedPositions[0];
-        Vector3 pNLocal = interpolatedPositions[interpolatedPositions.Length - 1];
-
-        // convert to world for distance to camera
-        Vector3 p0World = transform.TransformPoint(p0Local);
-        Vector3 pNWorld = transform.TransformPoint(pNLocal);
-
-        float d0 = (eyeCamera ? Vector3.Distance(eyeCamera.transform.position, p0World) : 0.2f);
-        float dN = (eyeCamera ? Vector3.Distance(eyeCamera.transform.position, pNWorld) : 0.2f);
-
-        // Compensate for local scale if useWorldSpace == false
-        float scale = Mathf.Max(1e-6f, transform.lossyScale.x);
-
-        // Compute world widths for the *saved* image height, then soften & cap
-        float wBase = PixelsToWorldWidth(minPixelsBase * pixelThicknessGain, d0) / scale;
-        float wTip  = PixelsToWorldWidth(minPixelsTip  * pixelThicknessGain, dN) / scale;
-
-        wBase = Mathf.Min(wBase, maxWorldWidth);
-        wTip  = Mathf.Min(wTip,  maxWorldWidth);
-
-        // Apply as width curve
-        var wc = new AnimationCurve();
-        wc.AddKey(0f, wBase);
-        wc.AddKey(1f, Mathf.Max(0.0005f, wTip));
-        lineRenderer.widthCurve = wc;
-
-        currentShape = interpolatedPositions;
+        currentShapeHead = headPositions;
         currentFrameIndex = frameIndex;
 
-        // update collision capsules along this whisker 
-        UpdateCollisionSegments(interpolatedPositions);
+        // 2) Convert HEAD -> WORLD for rendering + colliders
+        Vector3[] worldPositions = new Vector3[N];
+        for (int i = 0; i < N; i++)
+            worldPositions[i] = headOrigin.TransformPoint(headPositions[i]);
 
-        if (useMeshCollider) BakeMeshCollider(); 
+        currentShapeWorld = worldPositions;
 
+        // 3) Render in WORLD
+        if (lineRenderer != null)
+        {
+            lineRenderer.useWorldSpace = true;
+            lineRenderer.positionCount = worldPositions.Length;
+            lineRenderer.SetPositions(worldPositions);
+
+            Vector3 p0World = worldPositions[0];
+            Vector3 pNWorld = worldPositions[worldPositions.Length - 1];
+
+            float d0 = (eyeCamera ? Vector3.Distance(eyeCamera.transform.position, p0World) : 0.2f);
+            float dN = (eyeCamera ? Vector3.Distance(eyeCamera.transform.position, pNWorld) : 0.2f);
+
+            float scale = 1f; // world space: don't divide by lossyScale here
+
+            float wBase = PixelsToWorldWidth(minPixelsBase * pixelThicknessGain, d0) / scale;
+            float wTip  = PixelsToWorldWidth(minPixelsTip  * pixelThicknessGain, dN) / scale;
+
+            wBase = Mathf.Min(wBase, maxWorldWidth);
+            wTip  = Mathf.Min(wTip,  maxWorldWidth);
+
+            var wc = new AnimationCurve();
+            wc.AddKey(0f, wBase);
+            wc.AddKey(1f, Mathf.Max(0.0005f, wTip));
+            lineRenderer.widthCurve = wc;
+        }
+
+        // 4) Update collision capsules in WORLD
+        UpdateCollisionSegments(currentShapeWorld);
     }
 
-    private float ComputeSFromContact(Vector3 contactHead, Vector3[] ptsHead)
+    public float GetSContact() { return SContact; }
+
+    private float ComputeSFromContact(Vector3 contactHead, Vector3[] ptsHead, out float bestDist)
     {
-        if (ptsHead == null || ptsHead.Length < 2) return 0f;
+        bestDist = float.PositiveInfinity;
+        if (ptsHead == null || ptsHead.Length < 2) return -1f;
 
         // Precompute segment lengths + total length
         float totalLen = 0f;
-        float[] segLen = new float[ptsHead.Length - 1];
-        for (int i = 0; i < ptsHead.Length - 1; i++)
+        int segN = ptsHead.Length - 1;
+        float[] segLen = new float[segN];
+
+        for (int i = 0; i < segN; i++)
         {
             float L = Vector3.Distance(ptsHead[i], ptsHead[i + 1]);
             segLen[i] = L;
             totalLen += L;
         }
-        if (totalLen < 1e-8f) return 0f;
+        if (totalLen < 1e-8f) return -1f;
 
         // Find closest projection onto any segment
         int bestIdx = 0;
         float bestT = 0f;
         float bestDist2 = float.PositiveInfinity;
 
-        for (int i = 0; i < ptsHead.Length - 1; i++)
+        for (int i = 0; i < segN; i++)
         {
             Vector3 a = ptsHead[i];
             Vector3 b = ptsHead[i + 1];
@@ -169,28 +179,22 @@ public class Whisker : MonoBehaviour {
             }
         }
 
+        bestDist = Mathf.Sqrt(bestDist2);
+
         // Arc-length up to projection point
         float arc = 0f;
         for (int i = 0; i < bestIdx; i++) arc += segLen[i];
         arc += bestT * segLen[bestIdx];
 
-        return Mathf.Clamp01(arc / totalLen);
+        float u = arc / totalLen; // u=0 at ptsHead[0], u=1 at ptsHead[last]
+
+        // Want base=1, tip=0
+        bool baseIsIndex0 = ptsHead[0].sqrMagnitude < ptsHead[ptsHead.Length - 1].sqrMagnitude;
+        float s = baseIsIndex0 ? (1f - u) : u;
+
+        return Mathf.Clamp01(s);
     }
-
-    private Vector3[] GetCurrentShapeInHeadCoords()
-    {
-        Transform head = GameObject.Find("HeadOrigin").transform;
-
-        Vector3[] ptsHead = new Vector3[currentShape.Length];
-        for (int i = 0; i < currentShape.Length; i++)
-        {
-            // currentShape[i] is whisker-local -> world -> head-local
-            Vector3 world = transform.TransformPoint(currentShape[i]);
-            ptsHead[i] = head.InverseTransformPoint(world);
-        }
-        return ptsHead;
-    }
-
+    
     void CreateCollisionSegments()
     {
         collisionSegments = Mathf.Max(1, collisionSegments);
@@ -202,27 +206,56 @@ public class Whisker : MonoBehaviour {
             child.transform.SetParent(transform, worldPositionStays: false);
 
             var seg = child.AddComponent<WhiskerCollisionSegment>();
-            seg.SetWhiskerId(gameObject.name);   // all segments report as this whisker
 
             collisionSegs[i] = seg;
         }
     }
 
-    void OnCollisionEnter(Collision collision) {
+    int nContacts = 0;
+    float sumIntensity = 0f;
+    float minI = 1f, maxI = 0f;
+    public void RegisterIntensity(float intensity, string objName)
+    {
         hasContact = true;
+        lastContactObjectName = objName;
 
-        // Get contact point in world coordinates
-        Vector3 worldContact = collision.contacts[0].point;
-        Transform ratHead = GameObject.Find("HeadOrigin").transform;
-        Vector3 localContact = ratHead.InverseTransformPoint(worldContact);
+        SContact = Mathf.Max(SContact, Mathf.Clamp01(intensity));
+    }
 
-        lastContactPoint = localContact; 
-        lastContactNormal = collision.contacts[0].normal;  
-        lastContactObjectName = collision.gameObject.name;
-        // Debug.Log($"{gameObject.name} collided with {lastContactObjectName} at {lastContactPoint}");
+    private static string GetPath(Transform t)
+    {
+        var parts = new System.Collections.Generic.List<string>();
+        while (t != null) { parts.Add(t.name); t = t.parent; }
+        parts.Reverse();
+        return string.Join("/", parts);
+    }
 
-        var ptsHead = GetCurrentShapeInHeadCoords();
-        SContact = ComputeSFromContact(lastContactPoint, ptsHead);
+    public void RegisterContactFromSegment(Collider other, Vector3 segmentWorldPos)
+    {
+        hasContact = true;
+        lastContactObjectName = other.name;
+
+        if (currentShapeHead == null || currentShapeHead.Length < 2)
+        {
+            Debug.LogWarning("currentShapeHead not ready yet.");
+            SContact = 0f;
+            return;
+        }
+
+        Vector3 worldContact = other.ClosestPoint(segmentWorldPos);            // ClosestPoint is returned in WORLD space
+        Vector3 contactHead = headOrigin.InverseTransformPoint(worldContact);  // Convert WORLD -> HEAD
+
+        lastContactPoint = contactHead;
+
+        SContact = ComputeSFromContact(contactHead, currentShapeHead, out float dist);
+        Debug.Log($"[WHISKER CONTACT] {name} s={SContact:F3} theta={thetaWDeg:F2} dist={dist:F4}");
+    }
+
+    public void ClearContact()
+    {
+        hasContact = false;
+        SContact = 0f;
+        lastContactObjectName = "";
     }
 
     public void ResetContactInfo() {
@@ -234,23 +267,6 @@ public class Whisker : MonoBehaviour {
         SContact = 0f;  
     }
 
-    void BakeMeshCollider() {
-        if (bakedMesh != null) {
-            Destroy(bakedMesh);  
-        }
-
-        bakedMesh = new Mesh();
-        lineRenderer.BakeMesh(bakedMesh, false);
-
-        if (meshCollider == null)
-            meshCollider = gameObject.AddComponent<MeshCollider>();
-
-        meshCollider.sharedMesh = bakedMesh;
-        meshCollider.convex = true;
-        meshCollider.providesContacts = true;
-    }
-
-    // Sample along a polyline of points (local space)
     Vector3 SampleAlong(Vector3[] pts, float s)
     {
         s = Mathf.Clamp01(s);
@@ -267,26 +283,25 @@ public class Whisker : MonoBehaviour {
         if (collisionSegs == null || collisionSegs.Length == 0) return;
         if (interpolatedPositions == null || interpolatedPositions.Length < 2) return;
 
-        for (int i = 0; i < collisionSegs.Length; i++)
+        int N = collisionSegs.Length;
+
+        for (int i = 0; i < N; i++)
         {
-            // parameters along whisker from base→tip (avoid true endpoints a bit)
-            float s0 = (i + 0.1f) / (collisionSegs.Length + 0.2f);
-            float s1 = (i + 0.9f) / (collisionSegs.Length + 0.2f);
+            // arc-length fraction covered by this segment along the whisker
+            float s0 = (i + 0.1f) / (N + 0.2f);
+            float s1 = (i + 0.9f) / (N + 0.2f);
 
-            Vector3 p0Local = SampleAlong(interpolatedPositions, s0);
-            Vector3 p1Local = SampleAlong(interpolatedPositions, s1);
+            Vector3 p0 = SampleAlong(interpolatedPositions, s0);
+            Vector3 p1 = SampleAlong(interpolatedPositions, s1);
 
-            // convert to world space
-            Vector3 p0World = transform.TransformPoint(p0Local);
-            Vector3 p1World = transform.TransformPoint(p1Local);
-
-            collisionSegs[i].SetFromEndpoints(p0World, p1World, colliderRadius);
+            collisionSegs[i].SetFromEndpoints(p0, p1, colliderRadius, s0, s1);
+            collisionSegs[i].Init(this);
         }
     }
 
     void OnDestroy() {
         if (bakedMesh != null) {
-            Destroy(bakedMesh);  // 🧹 clean up once whisker is removed
+            Destroy(bakedMesh);  
         }
     }
     
@@ -299,27 +314,25 @@ public class Whisker : MonoBehaviour {
     }
 
     // === For generating objects for behavioural analysis ===
-    public Vector3 GetTipWorld() {
-        // Prefer LineRenderer (authoritative on-screen points)
-        if (lineRenderer != null && lineRenderer.positionCount > 0) {
-            Vector3 tip = lineRenderer.GetPosition(lineRenderer.positionCount - 1);
-            return lineRenderer.useWorldSpace ? tip : transform.TransformPoint(tip);
-        }
-        // Fallback to your stored curve
-        if (currentShape != null && currentShape.Length > 0) {
-            return transform.TransformPoint(currentShape[currentShape.Length - 1]);
-        }
+    public Vector3 GetTipWorld()
+    {
+        if (lineRenderer != null && lineRenderer.positionCount > 0)
+            return lineRenderer.GetPosition(lineRenderer.positionCount - 1); 
+
+        if (currentShapeWorld != null && currentShapeWorld.Length > 0)
+            return currentShapeWorld[currentShapeWorld.Length - 1];
+
         return transform.position;
     }
 
-    public Vector3 GetBaseWorld() {
-        if (lineRenderer != null && lineRenderer.positionCount > 0) {
-            Vector3 p0 = lineRenderer.GetPosition(0);
-            return lineRenderer.useWorldSpace ? p0 : transform.TransformPoint(p0);
-        }
-        if (currentShape != null && currentShape.Length > 0) {
-            return transform.TransformPoint(currentShape[0]);
-        }
+    public Vector3 GetBaseWorld()
+    {
+        if (lineRenderer != null && lineRenderer.positionCount > 0)
+            return lineRenderer.GetPosition(0); 
+
+        if (currentShapeWorld != null && currentShapeWorld.Length > 0)
+            return currentShapeWorld[0];
+
         return transform.position;
     }
 
@@ -332,11 +345,10 @@ public class Whisker : MonoBehaviour {
 
     void Start() {
         if (eyeCamera == null) {
-            // Try to auto-detect by tag or name
             var rightCam = GameObject.Find("RightEyeCamera");
             var leftCam  = GameObject.Find("LeftEyeCamera");
             if (rightCam) eyeCamera = rightCam.GetComponent<Camera>();
-            // or pick the correct side based on whisker name
         }
     }
 }
+
